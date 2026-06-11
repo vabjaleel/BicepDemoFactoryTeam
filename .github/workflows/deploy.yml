@@ -1,21 +1,41 @@
-name: Deploy customer environment
+name: Deploy environment
 
 on:
   workflow_dispatch:
     inputs:
       customer:
-        description: Customer short name (must match a folder under params/)
+        description: Customer short name (folder under params/)
         required: true
         type: string
+        default: contoso
       environment:
-        description: Environment short name (dev, test, prod, ...)
+        description: Environment short name (e.g. prod, test, dev)
         required: true
         type: string
-      location:
-        description: Azure region
-        required: true
-        type: string
-        default: eastus
+        default: prod
+      runWhatIf:
+        description: Run a what-if before deploying
+        required: false
+        type: boolean
+        default: true
+      whatIfFailureMode:
+        description: Behavior when what-if fails
+        required: false
+        type: choice
+        default: fail
+        options:
+          - fail
+          - warn
+      verbose:
+        description: Verbose logging and live operation tree
+        required: false
+        type: boolean
+        default: false
+      publishArtifacts:
+        description: Upload deployment artifacts
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   id-token: write
@@ -26,22 +46,53 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
-    name: Deploy ${{ inputs.customer }}/${{ inputs.environment }}
+  quality-gate:
+    name: Quality gate (build & lint)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Resolve parameter file
-        id: params
+      - name: Install Bicep CLI
+        run: az bicep install
+
+      - name: Build templates
         run: |
-          PARAM_FILE="params/${{ inputs.customer }}/${{ inputs.environment }}.bicepparam"
-          if [ ! -f "$PARAM_FILE" ]; then
-            echo "::error::Parameter file not found: $PARAM_FILE"
-            exit 1
-          fi
-          echo "file=$PARAM_FILE" >> "$GITHUB_OUTPUT"
+          az bicep build --file infra/entry.bicep --stdout > /dev/null
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+
+      - name: Lint all parameter files
+        run: |
+          mkdir -p validation
+          status=0
+          while IFS= read -r -d '' file; do
+            echo "::group::Linting $file"
+            out="validation/$(echo "$file" | tr '/' '_').json"
+            if ! az bicep build-params --file "$file" --outfile "$out"; then
+              echo "::error::Failed to build $file"
+              status=1
+            fi
+            echo "::endgroup::"
+          done < <(find params -name '*.bicepparam' -print0)
+          exit $status
+        env:
+          VM_ADMIN_PASSWORD: lint-placeholder
+
+      - name: Upload validation artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation
+          path: validation/
+
+  deploy:
+    name: Deploy ${{ inputs.customer }}/${{ inputs.environment }}
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    environment: bicep-vm-platform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -50,24 +101,64 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Create resource group
-        uses: azure/cli@v2
-        with:
-          azcliversion: latest
-          inlineScript: |
-            az group create \
-              --name "rg-${{ inputs.customer }}-${{ inputs.environment }}" \
-              --location "${{ inputs.location }}"
+      - name: Resolve parameter file
+        id: resolve
+        run: |
+          PARAM_FILE="params/${{ inputs.customer }}/${{ inputs.environment }}.bicepparam"
+          if [ ! -f "$PARAM_FILE" ]; then
+            echo "::error::Parameter file not found: $PARAM_FILE"
+            echo "Available customer/environment combinations:"
+            find params -name '*.bicepparam' | sed 's#params/##; s#\.bicepparam##; s#/# / #'
+            exit 1
+          fi
+          echo "file=$PARAM_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy Bicep
-        uses: azure/cli@v2
+      - name: Preflight summary
+        run: |
+          PARAM_FILE="${{ steps.resolve.outputs.file }}"
+          az bicep install
+          az bicep build-params --file "$PARAM_FILE" --outfile compiled.json
+          SUBNETS=$(jq -r '(.parameters.subnets.value // []) | length' compiled.json)
+          BATCHES=$(jq -r '(.parameters.vmBatches.value // []) | length' compiled.json)
+          {
+            echo "### Deployment preflight"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Parameter file | \`$PARAM_FILE\` |"
+            echo "| Customer | ${{ inputs.customer }} |"
+            echo "| Environment | ${{ inputs.environment }} |"
+            echo "| Resource group | rg-${{ inputs.customer }}-${{ inputs.environment }} |"
+            echo "| Subnets | $SUBNETS |"
+            echo "| VM batches | $BATCHES |"
+          } >> "$GITHUB_STEP_SUMMARY"
         env:
           VM_ADMIN_PASSWORD: ${{ secrets.VM_ADMIN_PASSWORD }}
+
+      - name: Deploy
+        run: |
+          chmod +x scripts/deploy.sh
+          ./scripts/deploy.sh --subscription n/a --param-file "${{ steps.resolve.outputs.file }}"
+        env:
+          VM_ADMIN_PASSWORD: ${{ secrets.VM_ADMIN_PASSWORD }}
+          RUN_WHATIF: ${{ inputs.runWhatIf }}
+          WHATIF_FAILURE_MODE: ${{ inputs.whatIfFailureMode }}
+          VERBOSE: ${{ inputs.verbose }}
+          ARTIFACT_DIR: artifacts
+
+      - name: Detect artifacts
+        id: artifacts
+        if: always()
+        run: |
+          if [ -d artifacts ] && [ -n "$(ls -A artifacts 2>/dev/null)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload deployment artifacts
+        if: always() && inputs.publishArtifacts && steps.artifacts.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
         with:
-          azcliversion: latest
-          inlineScript: |
-            az deployment group create \
-              --name "deploy-${{ inputs.customer }}-${{ inputs.environment }}-${{ github.run_id }}" \
-              --resource-group "rg-${{ inputs.customer }}-${{ inputs.environment }}" \
-              --template-file infra/main.bicep \
-              --parameters "${{ steps.params.outputs.file }}"
+          name: deployment-${{ inputs.customer }}-${{ inputs.environment }}
+          path: artifacts/

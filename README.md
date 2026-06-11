@@ -1,68 +1,113 @@
-# Bicep VM Factory
+# Bicep VM platform factory
 
-A multi-customer "factory" that deploys a virtual network and **N virtual machines** per
-customer environment using [Azure Verified Modules](https://aka.ms/avm) and GitHub Actions.
+Production-ready Bicep + GitHub Actions solution that deploys virtual-machine platform
+environments to Azure using pinned [Azure Verified Modules](https://aka.ms/avm). **One
+parameter file describes one customer environment**, and each environment deploys to its
+own resource group `rg-<customer>-<environmentName>`.
 
-Each customer/environment is deployed into **its own resource group** (`rg-<customer>-<environment>`).
+## Repository layout
 
 ```text
-infra/main.bicep              # Orchestrator (resourceGroup scope)
-infra/modules/network.bicep   # VNet + subnet (AVM virtual-network 0.9.0)
-infra/modules/compute.bicep   # One VM + NIC (AVM virtual-machine 0.22.1)
-params/<customer>/<env>.bicepparam
-.github/workflows/deploy.yml
+infra/
+  entry.bicep              # Public deployment contract (resource-group scoped)
+  main.bicep               # Orchestrator (networking + VM batch loop)
+  modules/
+    types.bicep            # Shared @export() user-defined types
+    validator.bicep        # Generic maxValue(0) fail-fast guard (no resources)
+    networking.bicep       # CIDR/subnet validation + AVM VNet
+    vm-batch.bicep         # Computer-name validation + VM loop
+    vm.bicep               # Single VM via AVM + standalone managed data disks
+params/
+  <customer>/<environment>.bicepparam   # one file per customer environment
+scripts/
+  deploy.sh                # Bash production deployment driver
+.github/workflows/
+  deploy.yml               # Manual-trigger CI/CD (GitHub Actions, OIDC)
+docs/
+  ARCHITECTURE.md
+  BEGINNER-GUIDE.md
+bicepconfig.json           # Strict analyzer rules
+.gitattributes             # LF for *.sh, *.bicep, *.bicepparam
+.gitignore
 README.md
 ```
 
+Seed environments: `params/contoso/prod.bicepparam` (mixed Linux + Windows, data disks,
+zones), `params/contoso/test.bicepparam` (multi-VM Linux batch), and
+`params/fabrikam/dev.bicepparam` (smallest valid config).
+
+## Prerequisites
+
+- Azure CLI + Bicep (`az bicep install`)
+- `jq` and Bash (Git Bash / WSL on Windows)
+- An Azure subscription and permission to create resource groups
+
 ## Quick start
 
-1. Configure the required GitHub secrets (see below) and OIDC.
-2. In GitHub, open **Actions → Deploy customer environment → Run workflow**.
-3. Provide the inputs:
-   - **customer** — must match a folder under `params/` (e.g. `contoso`)
-   - **environment** — must match a `.bicepparam` file (e.g. `dev`)
-   - **location** — Azure region (default `eastus`)
-4. The workflow resolves the parameter file, creates `rg-<customer>-<environment>`,
-   and deploys the VNet + VMs.
-
-### Local validation
-
-```powershell
-# Build the template
-az bicep build --file infra/main.bicep
-
-# Build a parameter file (password comes from an env var)
-$env:VM_ADMIN_PASSWORD = '<a-strong-password>'
-az bicep build-params --file params/contoso/dev.bicepparam
+```bash
+az login
+export VM_ADMIN_PASSWORD='<strong-password>'
+az bicep build --file infra/entry.bicep
+az bicep build-params --file params/contoso/prod.bicepparam
+./scripts/deploy.sh --param-file params/contoso/prod.bicepparam
 ```
 
-## How to add a customer
+## Validate
 
-Adding a customer (or environment) requires **no Bicep changes** — just add a parameter file:
+```bash
+# Template
+az bicep build --file infra/entry.bicep
 
-1. Create `params/<customer>/<environment>.bicepparam`.
-2. Set `customer`, `environment`, `addressPrefix`, `subnetPrefix`, `vmCount`, `vmSize`,
-   `osType`, and `adminUsername`. Use a **non-overlapping** address space.
-3. Keep `adminPassword = readEnvironmentVariable('VM_ADMIN_PASSWORD')` — never hardcode secrets.
-4. Do **not** set `location` in the param file; it comes from the workflow input.
-5. Commit, then run the workflow with the matching `customer` / `environment` inputs.
+# Every parameter file (password supplied via env var)
+export VM_ADMIN_PASSWORD='<temporary-strong-password>'
+for f in params/**/*.bicepparam; do az bicep build-params --file "$f"; done
+```
 
-> Tip: copy `params/contoso/dev.bicepparam` (Linux) or `params/fabrikam/prod.bicepparam`
-> (Windows) as a starting point.
+Both must exit 0 with no analyzer warnings.
 
-## Required GitHub secrets
+## Deployment flags (`scripts/deploy.sh`)
+
+| Flag / env | Default | Purpose |
+| --- | --- | --- |
+| `--param-file <path>` | (required) | Customer environment parameter file. |
+| `--subscription <id\|n/a>` | `n/a` | Subscription id, or current az context. |
+| `--location <region>` | (param/`eastus`) | Override resource group location. |
+| `VM_ADMIN_PASSWORD` | — | Required when the environment has VM batches. |
+| `RUN_WHATIF` | `true` | Run what-if before deploying. |
+| `WHATIF_FAILURE_MODE` | `fail` | `fail` or `warn` on what-if failure. |
+| `VERBOSE` | `false` | Verbose logging + live operation tree. |
+| `POLL_INTERVAL` | `15` | Seconds between status polls. |
+| `MAX_WAIT` | `3600` | Max seconds to wait. |
+| `ARTIFACT_DIR` | `./artifacts` | Output directory for JSON artifacts. |
+
+## Add a new customer or environment
+
+1. Create `params/<customer>/<environment>.bicepparam` (copy a seed file).
+2. Set `customer`, `environmentName`, `addressPrefixes`, `subnets`, `vmBatches`
+   (non-overlapping address space).
+3. Keep `vmAdminPassword = readEnvironmentVariable('VM_ADMIN_PASSWORD', '')`.
+4. Validate, commit, then run the workflow with the matching inputs.
+
+No Bicep changes are required to onboard a customer or environment.
+
+## GitHub Actions
+
+The `Deploy environment` workflow (`workflow_dispatch`) runs two jobs:
+
+1. **quality-gate** — builds `entry.bicep`/`main.bicep` and lints every
+   `params/**/*.bicepparam` into an uploaded `validation/` artifact.
+2. **deploy** — OIDC login, resolves the parameter file (failing with a list of valid
+   combinations if missing), prints a preflight summary, and runs `scripts/deploy.sh`.
+
+### Required secrets
 
 | Secret | Purpose |
 | --- | --- |
-| `AZURE_CLIENT_ID` | App registration (client) ID used for OIDC login |
-| `AZURE_TENANT_ID` | Entra ID tenant ID |
-| `AZURE_SUBSCRIPTION_ID` | Target subscription ID |
-| `VM_ADMIN_PASSWORD` | Local administrator password injected at deploy time |
+| `AZURE_CLIENT_ID` | App registration (client) ID for OIDC login. |
+| `AZURE_TENANT_ID` | Entra ID tenant ID. |
+| `AZURE_SUBSCRIPTION_ID` | Target subscription ID. |
+| `VM_ADMIN_PASSWORD` | VM local administrator password (injected at deploy time). |
 
-No client secret is stored — authentication uses **OIDC federation**.
-
-## One-line OIDC setup
-
-Create an Entra ID app registration with a **federated credential** (entity = Branch,
-branch `main`, subject `repo:<owner>/<repo>:ref:refs/heads/main`) and assign it the
-**Contributor** role on the target subscription (or resource group).
+No client secret is stored — authentication uses OIDC federation. See
+[docs/BEGINNER-GUIDE.md](docs/BEGINNER-GUIDE.md) for the one-time OIDC setup and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and validation rules.

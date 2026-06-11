@@ -1,0 +1,18 @@
+# Compiled Bicep / ARM artifacts
+infra/**/*.json
+params/**/*.json
+main.json
+compiled.json
+
+# Deployment / validation outputs
+artifacts/
+validation/
+
+# Local environment / secrets (never commit)
+.env
+*.env
+*.bicepparam.local
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
