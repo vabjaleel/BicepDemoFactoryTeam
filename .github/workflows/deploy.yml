@@ -1,0 +1,68 @@
+name: Deploy customer environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      customer:
+        description: Customer name (folder under params/)
+        required: true
+        type: string
+      environment:
+        description: Environment name (bicepparam file name, without extension)
+        required: true
+        type: string
+      location:
+        description: Azure region for the resource group
+        required: true
+        default: eastus
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+# Prevent concurrent deployments to the same customer environment.
+concurrency:
+  group: deploy-${{ inputs.customer }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve parameter file
+        id: params
+        run: |
+          PARAM_FILE="params/${{ inputs.customer }}/${{ inputs.environment }}.bicepparam"
+          if [ ! -f "$PARAM_FILE" ]; then
+            echo "::error::Parameter file not found: $PARAM_FILE"
+            exit 1
+          fi
+          echo "file=$PARAM_FILE" >> "$GITHUB_OUTPUT"
+          echo "Using parameter file: $PARAM_FILE"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create resource group
+        run: |
+          az group create \
+            --name "rg-${{ inputs.customer }}-${{ inputs.environment }}" \
+            --location "${{ inputs.location }}"
+
+      - name: Deploy
+        env:
+          VM_ADMIN_PASSWORD: ${{ secrets.VM_ADMIN_PASSWORD }}
+        run: |
+          az deployment group create \
+            --name "deploy-${{ inputs.customer }}-${{ inputs.environment }}-${{ github.run_id }}" \
+            --resource-group "rg-${{ inputs.customer }}-${{ inputs.environment }}" \
+            --template-file infra/main.bicep \
+            --parameters "${{ steps.params.outputs.file }}"
